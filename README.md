@@ -1,5 +1,7 @@
 # Steam Games Recommendation Engine
 
+[![CI](https://github.com/Siddhesh-Ai9797/steam-recommendation-engine/actions/workflows/ci.yml/badge.svg)](https://github.com/Siddhesh-Ai9797/steam-recommendation-engine/actions/workflows/ci.yml)
+
 A multimodal recommendation system for Steam games, combining graph neural networks, NLP, and computer vision into a single fused model, trained with PyTorch DDP across multiple GPUs and served through a FAISS-backed FastAPI endpoint.
 
 ## Architecture
@@ -31,6 +33,48 @@ Built a FAISS exact inner product index over the final fused game embeddings, wr
 ## Stack
 
 PyTorch, PyTorch Geometric, PyTorch DDP, sentence-transformers, CLIP, FAISS, FastAPI, Kaggle T4 x2 GPUs
+
+## Project structure
+
+```
+src/steam_rec/      Library code: data, models, training loops, metrics, FAISS index, API
+scripts/            Pipeline steps, run in order below
+tests/              Unit and API tests on small synthetic data
+notebooks/          Original Kaggle notebook with the full research and debugging log
+```
+
+## Reproducing the pipeline
+
+```bash
+pip install --extra-index-url https://download.pytorch.org/whl/cpu -e ".[embed]"
+
+python scripts/prepare_data.py --data-dir path/to/kaggle/steam
+python scripts/train_gnn.py                                 # one GPU
+torchrun --nproc_per_node=2 scripts/train_ddp.py            # or DDP across GPUs
+python scripts/embed_content.py --data-dir path/to/kaggle/steam
+python scripts/train_fusion.py                              # writes artifacts/
+```
+
+## Serving
+
+```bash
+uvicorn steam_rec.serve:app --reload
+# or
+docker build -t steam-rec . && docker run -p 8000:8000 steam-rec
+```
+
+| Endpoint | Returns |
+|---|---|
+| `GET /recommend/{user_node_id}?k=10` | Top K games for a user |
+| `GET /similar/{app_id}?k=10` | Games closest to a given game |
+| `GET /health` | Index size and status |
+
+## Tests
+
+```bash
+pip install -e ".[test]"
+pytest -q
+```
 
 ## Notes
 
