@@ -2,60 +2,89 @@
 
 [![CI](https://github.com/Siddhesh-Ai9797/steam-recommendation-engine/actions/workflows/ci.yml/badge.svg)](https://github.com/Siddhesh-Ai9797/steam-recommendation-engine/actions/workflows/ci.yml)
 
-A multimodal recommendation system for Steam games, combining graph neural networks, NLP, and computer vision into a single fused model, trained with PyTorch DDP across multiple GPUs and served through a FAISS-backed FastAPI endpoint.
+A multimodal recommender for Steam games. A graph neural network learns who plays what, then a two tower model fuses those signals with each game's description and header art. Training scales across GPUs with PyTorch DDP, and a FAISS index serves recommendations through a FastAPI service.
 
-## Architecture
+## Results
 
-**Phase 1, Data and Graph Construction**
-Built a bipartite user-game interaction graph from the Kaggle "Game Recommendations on Steam" dataset. Filtered to active users, 37,160 users and 36,229 games at dev scale, 213,364 users and 37,015 games at production scale, 8.47 million edges.
-
-**Phase 2, GNN Candidate Generation**
-Trained a SAGEConv-based heterogeneous graph neural network on link prediction with negative sampling. Achieved 0.9404 test AUC. Diagnosed moderate popularity bias in the candidate generator, expected at this stage, corrected in the fusion step.
-
-**Phase 3, NLP and CV Fusion**
-Fused three signals into one 128-dimensional item representation per game, the GNN embedding, a sentence-transformer embedding of the game's description, and a CLIP embedding of its header art. Trained the fusion layer with in-batch negative sampling after two earlier attempts collapsed under single-negative sampling. Final Recall@10 of 0.0112 on 20,000 held-out validation pairs, roughly 40x better than random.
-
-**Phase 4, Distributed Training**
-Retrained the GNN on the full production graph using PyTorch DDP across 2 Kaggle T4 GPUs. Achieved a 1.83x speedup over single-GPU training, 1069.52s down to 585.05s for 100 epochs.
-
-**Phase 5, Serving**
-Built a FAISS exact inner product index over the final fused game embeddings, wrapped in a FastAPI endpoint returning top-K recommendations for any user.
-
-## Key Results
-
-| Metric | Result |
+| Metric | Value |
 |---|---|
-| GNN candidate generator, test AUC | 0.9404 |
-| Fusion model, Recall@10 | 0.0112, ~40x random baseline |
-| DDP speedup, 1 GPU to 2 GPUs | 1.83x |
-| Production graph scale | 213,364 users, 37,015 games, 8.47M edges |
+| GNN candidate generator, test AUC | **0.9404** |
+| Fused model Recall@10 | 0.0112 on 20,000 held out pairs, about **40x** better than random |
+| DDP speedup, 1 to 2 GPUs | **1.83x**, from 1,069.5s to 585.1s for 100 epochs |
+| Production graph | 213,364 users, 37,015 games, 8.47M edges |
 
-## Stack
+## How it works
 
-PyTorch, PyTorch Geometric, PyTorch DDP, sentence-transformers, CLIP, FAISS, FastAPI, Kaggle T4 x2 GPUs
+```mermaid
+flowchart LR
+    R[Steam reviews] --> G[User to game graph]
+    G --> GNN[GraphSAGE link prediction]
+    M[Game descriptions] --> TXT[Sentence transformer]
+    I[Header art] --> CLIP[CLIP image encoder]
+    GNN --> F[Game tower: fusion MLP]
+    TXT --> F
+    CLIP --> F
+    GNN --> U[User tower]
+    F --> X[(FAISS index)]
+    U --> X
+    X --> API[FastAPI top K]
+```
+
+1. **Build the graph.** Reviews from the Kaggle Steam dataset become a graph with users on one side and games on the other. Users with fewer than 50 reviews are dropped. Each edge carries whether the user recommended the game and their normalized playtime.
+2. **Generate candidates.** A two layer GraphSAGE model learns user and game embeddings by predicting which edges exist, using negative sampling.
+3. **Add content.** Each game also gets a sentence transformer embedding of its description and a CLIP embedding of its header art. All three vectors are normalized so no single one dominates.
+4. **Fuse with two towers.** A game tower turns the three vectors into one 128 dimension embedding. A user tower projects GNN user vectors into the same space. Both train with in batch negatives and stop early on validation Recall@10.
+5. **Scale.** The GNN retrains on the full graph with PyTorch DDP across two GPUs.
+6. **Serve.** A FAISS inner product index over the final embeddings answers recommendation and similar game queries through FastAPI.
+
+## What I learned
+
+**Fusion collapsed twice before it worked.** With one negative per positive pair, the fusion model learned to give every game nearly the same vector, and three different users got 9 or 10 of the same top 10 games. Normalizing the vectors and switching to in batch negatives, where every other game in a batch counts as a negative, fixed it.
+
+**The GNN alone leans toward popular games.** Its recommendations overlapped heavily across users. Adding text and image signals in the fusion step spread them out.
+
+The notebook in `notebooks/` keeps the full research log, including a CLIP API change in the transformers library and Windows CUDA DLL issues, with the fix for each.
+
+## Tech stack
+
+| Area | Tools |
+|---|---|
+| Graph learning | PyTorch Geometric, GraphSAGE |
+| Content | sentence-transformers, CLIP |
+| Training | PyTorch, PyTorch DDP on 2 Kaggle T4 GPUs |
+| Serving | FAISS, FastAPI, Docker |
+| Testing | pytest, GitHub Actions |
 
 ## Project structure
 
 ```
-src/steam_rec/      Library code: data, models, training loops, metrics, FAISS index, API
-scripts/            Pipeline steps, run in order below
-tests/              Unit and API tests on small synthetic data
-notebooks/          Original Kaggle notebook with the full research and debugging log
+src/steam_rec/
+  data.py        Filter active users and build the graph
+  models.py      GraphSAGE encoder, fusion tower, user tower, contrastive loss
+  training.py    GNN and fusion training loops with early stopping
+  metrics.py     Recall@K and random baseline
+  index.py       FAISS index with save and load
+  serve.py       FastAPI service
+scripts/         Pipeline steps, run in order below
+tests/           Unit and API tests on small synthetic data
+notebooks/       Original Kaggle notebook and research log
 ```
 
-## Reproducing the pipeline
+## Running it
+
+Download the [Game Recommendations on Steam](https://www.kaggle.com/datasets/antonkozyriev/game-recommendations-on-steam) dataset, then:
 
 ```bash
 pip install --extra-index-url https://download.pytorch.org/whl/cpu -e ".[embed]"
 
-python scripts/prepare_data.py --data-dir path/to/kaggle/steam
-python scripts/train_gnn.py                                 # one GPU
-torchrun --nproc_per_node=2 scripts/train_ddp.py            # or DDP across GPUs
-python scripts/embed_content.py --data-dir path/to/kaggle/steam
-python scripts/train_fusion.py                              # writes artifacts/
+python scripts/prepare_data.py --data-dir path/to/steam
+python scripts/train_gnn.py                          # one GPU
+torchrun --nproc_per_node=2 scripts/train_ddp.py     # or several GPUs
+python scripts/embed_content.py --data-dir path/to/steam
+python scripts/train_fusion.py                       # writes artifacts/
 ```
 
-## Serving
+Serve the results:
 
 ```bash
 uvicorn steam_rec.serve:app --reload
@@ -66,7 +95,7 @@ docker build -t steam-rec . && docker run -p 8000:8000 steam-rec
 | Endpoint | Returns |
 |---|---|
 | `GET /recommend/{user_node_id}?k=10` | Top K games for a user |
-| `GET /similar/{app_id}?k=10` | Games closest to a given game |
+| `GET /similar/{app_id}?k=10` | Games most like a given game |
 | `GET /health` | Index size and status |
 
 ## Tests
@@ -76,6 +105,8 @@ pip install -e ".[test]"
 pytest -q
 ```
 
-## Notes
+The 16 tests cover graph building, both models, the contrastive loss, Recall@K, the FAISS index and every API endpoint. They use small synthetic data, so they run in seconds. GitHub Actions runs them on every push.
 
-Full build log covering real debugging along the way, representation collapse in the fusion layer, a transformers library breaking change in CLIP's API, Windows CUDA DLL issues, and the fixes for each, is documented in the notebook itself.
+## Author
+
+Siddhesh Patil, MS in Artificial Intelligence, DePaul University
